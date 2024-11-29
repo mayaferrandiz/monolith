@@ -1,10 +1,22 @@
-//pin1, pin2, motor#, board#, stateCode, last state change timestamp, is allowed to move, completed initial retraction sequence
+#include <SPI.h>
+#include <SD.h>
+#include <TMRpcm.h>
+
+TMRpcm audio;
+
+#define MOVEMENT_CYCLE_TIME 4500 //how long to move motors in and out for
+#define AUDIO_PIN_L 5
+#define AUDIO_PIN_G 23
+#define AUDIO_PIN_R 11
+
+//pin1, pin2, motor#, board#, stateCode, last state change timestamp, is allowed to move, completed initial retraction sequence, LED pin
 //statecodes: 2 = fully extended, 1 = extending, -1 = retracting, -2 = fully retracted
+//53 51 49 47 45 33 31 29
 unsigned long motors[9][8] = {
   { 36, 34, 4, 0, 0, 0, 0, 0 },  //0 top
 
-  { 5, 4, 2, 0, 0, 0, 0, 0 },    //1 top front
-  { 52, 50, 0, 0, 0, 0, 0, 0 },  //2 top left
+  { 10, 4, 2, 0, 0, 0, 0, 0 },    //1 top front
+  { 45, 43, 0, 0, 0, 0, 0, 0 },  //2 top left
   { 48, 46, 0, 1, 0, 0, 0, 0 },  //3 top back
   { 3, 2, 2, 1, 0, 0, 0, 0 },    //4 top right
 
@@ -13,6 +25,10 @@ unsigned long motors[9][8] = {
   { 9, 8, 3, 0, 0, 0, 0, 0 },    //7 bottom back left
   { 40, 38, 1, 1, 0, 0, 0, 0 }   //8 bottom back right
 };
+
+int countReadyMotors = 0;
+bool allMotorsReady = false;
+bool movementStarted = false;
 
 //board conflicts
 //1 and 4, 2 and 3, 6 and 7, 5 and 8
@@ -23,18 +39,33 @@ int patterns[2][9] = {
 };
 
 int patternStep = 0;
-int patternNumber = 0;
-int readyMotors = 0;
-bool allMotorsReady = false;
-bool movementStarted = false;
+int patternIndex = 0;
 
-#define MOVEMENT_CYCLE_TIME 4000
-#define AUDIO_PIN_L 22
-#define AUDIO_PIN_G 24
-#define AUDIO_PIN_R 26
+char const * audioFiles[3] = {
+  "file1.wav",
+  "file2.wav",
+  "file3.wav"
+};
+
+//duration, amount played, playback started timestamp
+unsigned long audioPlayback[3][3] = {
+  {1000,0,0},
+  {2000,0,0},
+  {2000,0,0}
+};
+
+int audioIndex = 0;
+char const * audioFileName = audioFiles[audioIndex];
+unsigned long audioPosition = 0;
 
 void setup() {
   Serial.begin(9600);
+
+  SD.begin();
+  audio.speakerPin = AUDIO_PIN_L;
+  pinMode(AUDIO_PIN_R, OUTPUT);
+  audio.loop(1);
+
   for (int i = 0; i < 9; i++) {
     pinMode(int(motors[i][0]), OUTPUT);
     pinMode(int(motors[i][1]), OUTPUT);
@@ -57,6 +88,22 @@ unsigned long getLastStateChangeTime(int i) {
   return motors[i][5];
 }
 
+char const * getAudioFilename(int audioIndex){
+  return audioFiles[audioIndex];
+}
+
+unsigned long getAudioTrackDuration(int audioIndex){
+  return audioPlayback[audioIndex][0];
+}
+
+unsigned long getAudioPlaybackPosition(int audioIndex){
+  return audioPlayback[audioIndex][1];
+}
+
+unsigned long getAudioPlaybackStartedTimestamp(int audioIndex){
+  return audioPlayback[audioIndex][2];
+}
+
 void setState(int i, int state) {
   motors[i][4] = state;
 }
@@ -77,8 +124,33 @@ void setIsExtending(int i) {
   setState(i, 1);
 }
 
+void setLastStateChangeTime(int i, unsigned long time) {
+  motors[i][5] = time;
+}
+
+void setIsAllowedToMove(int i, bool isAllowed) {
+  if (isAllowed) motors[i][6] = 1;
+  else motors[i][6] = 0;
+}
+
 void setCompletedInitialRetraction(int i){
   motors[i][7] = 1;
+}
+
+void setAudioPlaybackStartedTimestamp(int audioIndex){
+  audioPlayback[audioIndex][2] = millis();
+}
+
+void setAudioPlaybackPosition(int audioIndex){
+  unsigned long now = millis();
+  unsigned long lastPosition = getAudioPlaybackPosition(audioIndex);
+  unsigned long playbackStartedTimestamp = getAudioPlaybackStartedTimestamp(audioIndex);
+  unsigned long duration = getAudioTrackDuration(audioIndex);
+
+  unsigned long incrementalPlayback = now - playbackStartedTimestamp;
+
+  if (lastPosition + incrementalPlayback > duration) audioPlayback[audioIndex][1] = (lastPosition + incrementalPlayback)%duration;
+  else audioPlayback[audioIndex][1] = lastPosition + incrementalPlayback;
 }
 
 bool isRetracting(int i) {
@@ -134,15 +206,6 @@ bool isSameBoardMotorMoving(int i) {
   }
 
   return otherMotorMoving;
-}
-
-void setLastStateChangeTime(int i, unsigned long time) {
-  motors[i][5] = time;
-}
-
-void setIsAllowedToMove(int i, bool isAllowed) {
-  if (isAllowed) motors[i][6] = 1;
-  else motors[i][6] = 0;
 }
 
 void printState(int i) {
@@ -220,10 +283,20 @@ void stop(int i) {
   Serial.println();
 }
 
+void nextAudio(){
+  setAudioPlaybackPosition(audioIndex);
+  audioIndex = (audioIndex+1)%3;
+  audioFileName = getAudioFilename(audioIndex);
+  audioPosition = getAudioPlaybackPosition(audioIndex) / 1000;
+  audio.play("switch.wav",0,1);
+  audio.play(audioFileName,audioPosition,0);
+  setAudioPlaybackStartedTimestamp(audioIndex);
+}
+
 void nextPattern(){
-  patternNumber = (patternNumber+1)%2;
+  patternIndex = (patternIndex+1)%2;
   Serial.print("Switching to pattern ");
-  Serial.print(patternNumber);
+  Serial.print(patternIndex);
   Serial.println();
 }
 
@@ -235,9 +308,11 @@ bool isPatternComplete(){
   return patternStep == 8;
 }
 
+int now = 0;
+
 void loop() {
 
-  int now = millis();
+  now = millis();
 
   for (int i = 0; i < 9; i++) {
 
@@ -250,19 +325,22 @@ void loop() {
         setIsAllowedToMove(i, false);
       }
     } else {
-      readyMotors = readyMotors + 1;
-      allMotorsReady = (readyMotors == 9);
+      countReadyMotors = countReadyMotors + 1;
+      allMotorsReady = (countReadyMotors == 9);
     }
 
     if (allMotorsReady && !movementStarted){
       Serial.print("Starting movement sequence");
       Serial.println();
-      setIsAllowedToMove(patterns[patternNumber][0], true);
+      setIsAllowedToMove(patterns[patternIndex][patternStep], true);
       movementStarted = true;
     }
 
     if (isAllowedToMove(i)) {
-      if (isFullyRetracted(i) && !isExtending(i)) extend(i);
+      if (isFullyRetracted(i) && !isExtending(i)) {
+        nextAudio();
+        extend(i);
+      }
       else if (isExtending(i) && isMovementComplete(i) && !isFullyExtended(i)) {
         setIsFullyExtended(i);
         stop(i);
@@ -270,7 +348,7 @@ void loop() {
         retract(i);
         if (isPatternComplete()) nextPattern();
         nextPatternStep();
-        setIsAllowedToMove(patterns[patternNumber][patternStep], true);
+        setIsAllowedToMove(patterns[patternIndex][patternStep], true);
       } else if (isRetracting(i) && isMovementComplete(i) && !isFullyRetracted(i)) {
         setIsFullyRetracted(i);
         stop(i);
