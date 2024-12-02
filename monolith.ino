@@ -4,70 +4,19 @@
 #include <Adafruit_NeoPixel.h>
 
 //MOTOR VARIABLES
-
-#define MOVEMENT_CYCLE_TIME 4500 //how long to extend/retract motors for
-
-//pin1, pin2, motor#, board#, stateCode, last motor state change timestamp, is allowed to move, current LED brightness, last LED fade timestamp
-//statecodes: 2 = fully extended, 1 = extending, -1 = retracting, -2 = fully retracted
-unsigned long motors[9][10] = {
-  { 36, 34, 4, 0, 0, 0, 0, 0, 0 },  //0 top
-
-  { 10, 4, 2, 0, 0, 0, 0, 0, 0 },    //1 top front
-  { 45, 43, 0, 0, 0, 0, 0, 0, 0 },  //2 top left
-  { 48, 46, 0, 1, 0, 0, 0, 0, 0 },  //3 top back
-  { 3, 2, 2, 1, 0, 0, 0, 0, 0 },    //4 top right
-
-  { 44, 42, 1, 0, 0, 0, 0, 0, 0 },  //5 bottom front right
-  { 7, 6, 3, 1, 0, 0, 0, 0, 0 },    //6 bottom front left
-  { 9, 8, 3, 0, 0, 0, 0, 0, 0 },    //7 bottom back left
-  { 40, 38, 1, 1, 0, 0, 0, 0, 0 }   //8 bottom back right
-};
-
-bool allMotorsExtended = false;
-bool allMotorsRetracted = false;
-
-//board conflicts
-//1 and 4, 2 and 3, 6 and 7, 5 and 8
-//two motors moving at once
-int patterns[2][9] = {
-  //{ 0, 5, 2, 8, 1, 7, 4, 6, 3},  //waves
-  { 0, 1, 2, 4, 3, 5, 6, 8, 7},  //radials
-  { 0, 1, 2, 4, 3, 5, 6, 8, 7}  //radials
-};
-
-int patternStep = 0;
-int patternIndex = 0;
-int completedPatternCount = -1;
-
-//AUDIO VARIABLES
-
-TMRpcm audio;
-#define AUDIO_PIN_L 5
-#define AUDIO_PIN_G 23
-#define AUDIO_PIN_R 11
-
-char const * audioFiles[3] = {
-  "file1.wav",
-  "file2.wav",
-  "file3.wav"
-};
-
-//duration, amount played, playback started timestamp
-unsigned long audioPlayback[3][3] = {
-  {1000,0,0},
-  {2000,0,0},
-  {2000,0,0}
-};
-
-int audioIndex = 0;
-char const * audioFileName = audioFiles[audioIndex];
-unsigned long audioPosition = 0;
-
-//LED VARIABLES
-
 #define LED_COUNT 2 // Number of LEDs per strip
+static const unsigned int MOTOR_COUNT = 9;
+static const unsigned int MAX_POSITION = 4500; //how long to extend/retract motors for in milliseconds
+static const unsigned int MIN_POSITION = 0;
+bool runPatterns = false;
 
-// Create Adafruit_NeoPixel objects for each LED strip
+const char* concatenate(const char* text, uint8_t number) {
+    static char buffer[16]; // Adjust size as needed
+    char numChar = '0' + number; // Convert number to character ('0' + 2 = '2')
+    snprintf(buffer, sizeof(buffer), "%s %c", text, numChar);
+    return buffer;
+}
+
 Adafruit_NeoPixel led_0(LED_COUNT, 47, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel led_1(LED_COUNT, 37, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel led_2(LED_COUNT, 41, NEO_GRB + NEO_KHZ800);
@@ -78,17 +27,180 @@ Adafruit_NeoPixel led_6(LED_COUNT, 29, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel led_7(LED_COUNT, 39, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel led_8(LED_COUNT, 33, NEO_GRB + NEO_KHZ800);
 
-Adafruit_NeoPixel* LEDs[9] = {
-  &led_0,
-  &led_1,
-  &led_2,
-  &led_3,
-  &led_4,
-  &led_5,
-  &led_6,
-  &led_7,
-  &led_8
+struct Motor {
+  const uint8_t pin1;
+  const uint8_t pin2;
+  const uint8_t motorNumber;
+  const uint8_t boardNumber;
+  const uint8_t id;
+  Adafruit_NeoPixel* led;
+  int position = MAX_POSITION;
+  int targetPosition = MIN_POSITION;
+  unsigned long lastStateChange = 0;
+  uint8_t ledBrightness = 0;
+  bool isInitialized = false;
+  bool isStopped = false;
+  bool isMoving = false;
+  bool isWaiting = false;
+  bool printedMoveLogForThisTarget = false;
+
+  bool reachedTarget(){ return position == targetPosition; }
+  void setInitialized(){
+    isInitialized = true;
+    this->setLEDBrightness(0);
+    this->print("✅ Initialized");
+  }
+  void setTargetPosition(unsigned int target){
+    if (target != targetPosition){
+      lastStateChange = millis();
+      targetPosition = constrain(target,MIN_POSITION,MAX_POSITION); 
+      printedMoveLogForThisTarget = false;
+      this->print("New Target");
+    }
+  }
+  void wait(uint8_t id){
+    if (!isWaiting){
+      lastStateChange = millis();
+      isWaiting = true;
+      if (!isStopped) this->print( concatenate("Waiting ", id) );
+    }
+  }
+  void noWait(uint8_t id){
+    if (isWaiting){
+      lastStateChange = millis();
+      isWaiting = false;
+      if (!isStopped) this->print( concatenate("Not Waiting ", id) );
+    }
+  }
+  void stop() {
+    isStopped = true;
+    isMoving = false;
+    isWaiting = false;
+    lastStateChange = millis();
+
+    this->print("Stopping");
+    digitalWrite(pin1, LOW);
+    digitalWrite(pin2, LOW);
+  }
+  void move(){
+    isMoving = true;
+    isStopped = false;
+    isWaiting = false;
+
+    if (!printedMoveLogForThisTarget) {
+      printedMoveLogForThisTarget = true;
+      this->print("Moving");
+    }
+    int direction = targetPosition > position ? 1 : -1;
+    unsigned long now = millis();
+    int incrementalMotorPosition = now - lastStateChange;
+    int nextPosition = position + direction*incrementalMotorPosition;
+    position = constrain(nextPosition,MIN_POSITION,MAX_POSITION);
+    
+    lastStateChange = now;
+
+    if (direction == 1){
+      this->setLEDBrightness(255);
+      digitalWrite(pin1, LOW);
+      digitalWrite(pin2, HIGH);
+    } 
+    else if (direction == -1){
+
+      if (isInitialized) this->setLEDBrightness(0);
+      digitalWrite(pin1, HIGH);
+      digitalWrite(pin2, LOW);
+    }
+  }
+  void setLEDBrightness(uint8_t newBrightness){
+    if (ledBrightness != newBrightness){
+      ledBrightness = newBrightness;
+      led->setPixelColor(0, led->Color(newBrightness, newBrightness, newBrightness));
+      led->setPixelColor(1, led->Color(newBrightness, newBrightness, newBrightness));
+      led->show();
+    }
+  }
+  void print(const char * eventName){
+    Serial.print("[");
+    Serial.print(id);
+    Serial.print("] ");
+    Serial.print(eventName);
+    Serial.print("; ");
+    Serial.print(position);
+    Serial.print("->");
+    Serial.print(targetPosition);
+    Serial.print(" ");
+    if (isStopped) Serial.print("🔴");
+    if (isMoving) Serial.print("🟢");
+    if (isWaiting) Serial.print("🟡");
+    Serial.println();
+  }
+
+  Motor(uint8_t p1, uint8_t p2, uint8_t bNum, uint8_t mNum, uint8_t id, Adafruit_NeoPixel* ledObj) : pin1(p1), pin2(p2), boardNumber(bNum), motorNumber(mNum), id(id), led(ledObj) {}
 };
+
+Motor motor2(45, 43, 0, 0, 2, &led_2);
+Motor motor3(48, 46, 0, 1, 3, &led_3);
+Motor motor5(44, 42, 1, 0, 5, &led_5);
+Motor motor8(40, 38, 1, 1, 8, &led_8);
+Motor motor1(10, 4 , 2, 0, 1, &led_1);
+Motor motor4(3 , 2 , 2, 1, 4, &led_4);
+Motor motor6(7 , 6 , 3, 1, 6, &led_6);
+Motor motor7(9 , 8 , 3, 0, 7, &led_7);
+Motor motor0(36, 34, 4, 0, 0, &led_0);
+
+Motor m[MOTOR_COUNT] = {motor0,motor1,motor2,motor3,motor4,motor5,motor6,motor7,motor8};
+
+struct PatternStep {
+  const uint8_t motor;
+  const uint8_t target;
+}
+
+struct Pattern {
+  const uint8_t[MOTOR_COUNT] steps;
+}
+
+static const uint8_t PATTERN_COUNT = 2;
+uint8_t patternStep = 0;
+uint8_t patternIndex = 0;
+
+//board conflicts
+//1 and 4, 2 and 3, 6 and 7, 5 and 8
+//two motors moving at once
+const uint8_t patterns[PATTERN_COUNT][MOTOR_COUNT] = {
+  { 0, 5, 2, 8, 1, 7, 4, 6, 3},  //waves
+  { 0, 1, 2, 4, 3, 5, 6, 8, 7}  //radials
+};
+
+//AUDIO VARIABLES
+
+TMRpcm audio;
+#define AUDIO_PIN_L 5
+#define AUDIO_PIN_G 23
+#define AUDIO_PIN_R 11
+
+struct Audio {
+  char const * fileName;
+  unsigned long duration;
+  unsigned long seekPosition;
+  unsigned long playbackStartedTimestamp;
+
+  void saveSeekPosition(){
+    unsigned long now = millis();
+    unsigned long incrementalPlayback = now - playbackStartedTimestamp;
+
+    if (seekPosition + incrementalPlayback > duration) seekPosition = (seekPosition + incrementalPlayback)%duration;
+    else seekPosition = seekPosition + incrementalPlayback;
+  }
+
+  Audio(char const * fn, unsigned long dur, unsigned long seek, unsigned long ts) : fileName(fn), duration(dur), seekPosition(seek), playbackStartedTimestamp(ts) {}
+};
+
+Audio audio1("file1.wav", 1000, 0, 0);
+Audio audio2("file2.wav", 1000, 0, 0);
+
+static const uint8_t AUDIO_COUNT = 2;
+uint8_t audioIndex = 0;
+Audio au[AUDIO_COUNT] = {audio1,audio2};
 
 void setup() {
   Serial.begin(9600);
@@ -98,369 +210,86 @@ void setup() {
   pinMode(AUDIO_PIN_R, OUTPUT);
   audio.loop(1);
 
-  for (int motorIndex = 0; motorIndex < 9; motorIndex++) {
-    pinMode(int(motors[motorIndex][0]), OUTPUT);
-    pinMode(int(motors[motorIndex][1]), OUTPUT);
-    LEDs[motorIndex]->begin();
-    LEDs[motorIndex]->show(); // Turn off all LEDs initially
+  for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+    pinMode(m[i].pin1, OUTPUT);
+    pinMode(m[i].pin2, OUTPUT);
+    m[i].led->begin();
+    m[i].led->show();
   }
 }
 
-//MOTORS
-
-int getBoardNumber(int motorIndex) {
-  return motors[motorIndex][2];
+bool allMotorsInitialized(){
+  uint8_t countInitialized = 0;
+  for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+    if (m[i].isInitialized) countInitialized = countInitialized+1;
+  }
+  return countInitialized == MOTOR_COUNT;
 }
 
-int getMotorNumber(int motorIndex) {
-  return motors[motorIndex][3];
-}
+uint8_t getSameBoardMotorId(uint8_t i){
+  uint8_t boardNumber = m[i].boardNumber;
+  uint8_t motorNumber = m[i].motorNumber;
+  uint8_t otherBoard = 0;
+  uint8_t otherMotor = 0;
 
-unsigned long getLastMotorMovementStateChangeTime(int motorIndex) {
-  return motors[motorIndex][5];
-}
+  uint8_t id = 255;
 
-void setIsFullyRetracted(int motorIndex) {
-  motors[motorIndex][4] = -2;
-}
+  for (uint8_t j = 0; j < MOTOR_COUNT; j++) {
 
-void setIsFullyExtended(int motorIndex) {
-  motors[motorIndex][4] = 2;
-}
+    otherBoard = m[j].boardNumber;
+    otherMotor = m[j].motorNumber;
 
-void setIsRetracting(int motorIndex) {
-  motors[motorIndex][4] = -1;
-}
-
-void setIsExtending(int motorIndex) {
-  motors[motorIndex][4] = 1;
-}
-
-void setLastMotorMovementStateChangeTime(int motorIndex, unsigned long time) {
-  motors[motorIndex][5] = time;
-}
-
-void setMotorIsAllowedToMove(int motorIndex, bool isAllowed) {
-  if (isAllowed) motors[motorIndex][6] = 1;
-  else motors[motorIndex][6] = 0;
-}
-
-bool isRetracting(int motorIndex) {
-  return motors[motorIndex][4] == -1;
-}
-
-bool isFullyRetracted(int motorIndex) {
-  return motors[motorIndex][4] == -2;
-}
-
-bool isExtending(int motorIndex) {
-  return motors[motorIndex][4] == 1;
-}
-
-bool isFullyExtended(int motorIndex) {
-  return motors[motorIndex][4] == 2;
-}
-
-bool isAllowedToMove(int motorIndex) {
-  return motors[motorIndex][6] == 1;
-}
-
-bool isMoving(int motorIndex) {
-  return getLastMotorMovementStateChangeTime(motorIndex) + MOVEMENT_CYCLE_TIME > millis() && (isRetracting(motorIndex) || isExtending(motorIndex));
-}
-
-bool isMovementComplete(int motorIndex) {
-  return getLastMotorMovementStateChangeTime(motorIndex) + MOVEMENT_CYCLE_TIME < millis();
-}
-
-bool isSameBoardMotorMoving(int motorIndex) {
-
-  const int board = getBoardNumber(motorIndex);
-  const int motor = getMotorNumber(motorIndex);
-
-  int otherBoard = 0;
-  int otherMotor = 0;
-
-  bool otherMotorMoving = false;
-
-  for (int otherMotorIndex = 0; otherMotorIndex < 9; otherMotorIndex++) {
-
-    otherBoard = getBoardNumber(otherMotorIndex);
-    otherMotor = getMotorNumber(otherMotorIndex);
-
-    if (board == otherBoard && motor != otherMotor) otherMotorMoving = isMoving(otherMotorIndex);
+    if (boardNumber == otherBoard && motorNumber != otherMotor) id = j;
   }
 
-  return otherMotorMoving;
+  return id;
 }
 
-void printMotorState(int motorIndex) {
-  Serial.print("Motor: ");
-  Serial.print(motorIndex);
-  Serial.print(" - Board #:");
-  Serial.print(getBoardNumber(motorIndex));
-  Serial.print(" - Motor #:");
-  Serial.print(getMotorNumber(motorIndex));
-  // Serial.print(" - State: ");
-  // Serial.print(getMotorMovementState(motorIndex));
-  Serial.print(" - Is allowed to move: ");
-  Serial.print(isAllowedToMove(motorIndex));
-  Serial.print(" - Last state change timestamp: ");
-  Serial.print(getLastMotorMovementStateChangeTime(motorIndex));
-
-  Serial.println();
+bool isSameBoardMotorMoving(uint8_t i){
+  uint8_t other = getSameBoardMotorId(i);
+  if (other == 255) return false;
+  else return !m[other].reachedTarget() && !m[other].isStopped && !m[other].isWaiting;
 }
 
-void extend(int motorIndex) {
-  if (!isSameBoardMotorMoving(motorIndex)) {
-    setIsExtending(motorIndex);
-    setLastMotorMovementStateChangeTime(motorIndex, millis());
-
-    int pin1 = motors[motorIndex][0];
-    int pin2 = motors[motorIndex][1];
-
-    digitalWrite(pin1, LOW);
-    digitalWrite(pin2, HIGH);
-
-    Serial.print("Extending motor ");
-    Serial.print(motorIndex);
-    Serial.println();
-  } else {
-    int boardNumber = getBoardNumber(motorIndex);
-    Serial.print("ERROR: Tried to move both motors on board ");
-    Serial.print(boardNumber);
-    Serial.println();
-  }
-}
-
-void retract(int motorIndex) {
-  if (!isSameBoardMotorMoving(motorIndex)) {
-    setIsRetracting(motorIndex);
-    setLastMotorMovementStateChangeTime(motorIndex, millis());
-
-    int pin1 = motors[motorIndex][0];
-    int pin2 = motors[motorIndex][1];
-
-    digitalWrite(pin1, HIGH);
-    digitalWrite(pin2, LOW);
-
-    Serial.print("Retracting motor ");
-    Serial.print(motorIndex);
-    Serial.println();
-  } else {
-    int boardNumber = getBoardNumber(motorIndex);
-    Serial.print("ERROR: Tried to move both motors on board ");
-    Serial.print(boardNumber);
-    Serial.println();
-  }
-}
-
-void stop(int motorIndex) {
-  int pin1 = motors[motorIndex][0];
-  int pin2 = motors[motorIndex][1];
-
-  digitalWrite(pin1, LOW);
-  digitalWrite(pin2, LOW);
-
-  Serial.print("Stopping motor ");
-  Serial.print(motorIndex);
-  Serial.println();
-}
-
-void extendAllMotors(){
-
-  int stateVector = 0;
-
-  for (int motorIndex = 0; motorIndex < 9; motorIndex++) {
-    if (!isExtending(motorIndex) && !isFullyExtended(motorIndex) && !isSameBoardMotorMoving(motorIndex)) extend(motorIndex);
-    else if (isExtending(motorIndex) && isMovementComplete(motorIndex)){
-      setIsFullyExtended(motorIndex);
-      stop(motorIndex);
-      setMotorIsAllowedToMove(motorIndex, false);
-    }
-    stateVector = stateVector + motors[motorIndex][4];
-  }
-
-  if (stateVector == 18) allMotorsExtended = true;
-}
-
-void retractAllMotors(){
-
-  int stateVector = 0;
-
-  for (int motorIndex = 0; motorIndex < 9; motorIndex++) {
-    if (!isRetracting(motorIndex) && !isFullyRetracted(motorIndex) && !isSameBoardMotorMoving(motorIndex)) retract(motorIndex);
-    else if (isRetracting(motorIndex) && isMovementComplete(motorIndex)){
-      setIsFullyRetracted(motorIndex);
-      stop(motorIndex);
-      setMotorIsAllowedToMove(motorIndex, false);
-    }
-    stateVector = stateVector + motors[motorIndex][4];
-  }
-
-  if (stateVector == -18) allMotorsExtended = true;
-}
-
-//LEDs
-
-void setLEDBrightness(int motorIndex, uint8_t newBrightness){
-  if (motors[motorIndex][7] != newBrightness){
-    motors[motorIndex][7] = newBrightness;
-    LEDs[motorIndex]->setPixelColor(0, LEDs[motorIndex]->Color(newBrightness, newBrightness, newBrightness));
-    LEDs[motorIndex]->setPixelColor(1, LEDs[motorIndex]->Color(newBrightness, newBrightness, newBrightness));
-    LEDs[motorIndex]->show();
-  }
-}
-
-void turnOnLED(int motorIndex){
-  setLEDBrightness(motorIndex, 255);
-}
-
-void turnOnAllLEDs(){
-  for (int motorIndex = 0; motorIndex < 9; motorIndex++) {
-    turnOnLED(motorIndex);
-  }
-}
-
-void turnOffLED(int motorIndex){
-  setLEDBrightness(motorIndex, 0);
-}
-
-void turnOffAllLEDs(){
-  for (int motorIndex = 0; motorIndex < 9; motorIndex++) {
-    turnOffLED(motorIndex);
-  }
-}
-
-void fadeLED(int motorIndex, bool fadeIn) {
-    unsigned long currentTime = millis();
-    unsigned long lastFadeTime = motors[motorIndex][9];
-    int currentBrightness = motors[motorIndex][8];
-
-    // Calculate step delay for fading
-    const int fadeSteps = 256; // 0 to 255 brightness levels
-    int stepDelay = MOVEMENT_CYCLE_TIME / fadeSteps;
-
-    if (currentTime - lastFadeTime >= stepDelay) {
-        // Determine fade direction
-        uint8_t newBrightness = fadeIn ? currentBrightness + 1 : currentBrightness - 1;
-        newBrightness = constrain(newBrightness, 0, 255);
-
-        // Update LEDs for the specific motor
-        LEDs[motorIndex]->setPixelColor(0, LEDs[motorIndex]->Color(newBrightness, newBrightness, newBrightness));
-        LEDs[motorIndex]->setPixelColor(1, LEDs[motorIndex]->Color(newBrightness, newBrightness, newBrightness));
-        LEDs[motorIndex]->show();
-
-        motors[motorIndex][8] = newBrightness;
-        motors[motorIndex][9] = currentTime;  // Update last fade time
-    }
-}
-
-//AUDIO
-
-char const * getAudioFilename(int audioIndex){
-  return audioFiles[audioIndex];
-}
-
-unsigned long getAudioTrackDuration(int audioIndex){
-  return audioPlayback[audioIndex][0];
-}
-
-unsigned long getAudioPlaybackPosition(int audioIndex){
-  return audioPlayback[audioIndex][1];
-}
-
-unsigned long getAudioPlaybackStartedTimestamp(int audioIndex){
-  return audioPlayback[audioIndex][2];
-}
-
-void setAudioPlaybackStartedTimestamp(int audioIndex){
-  audioPlayback[audioIndex][2] = millis();
-}
-
-void setAudioPlaybackPosition(int audioIndex){
-  unsigned long now = millis();
-  unsigned long lastPosition = getAudioPlaybackPosition(audioIndex);
-  unsigned long playbackStartedTimestamp = getAudioPlaybackStartedTimestamp(audioIndex);
-  unsigned long duration = getAudioTrackDuration(audioIndex);
-
-  unsigned long incrementalPlayback = now - playbackStartedTimestamp;
-
-  if (lastPosition + incrementalPlayback > duration) audioPlayback[audioIndex][1] = (lastPosition + incrementalPlayback)%duration;
-  else audioPlayback[audioIndex][1] = lastPosition + incrementalPlayback;
-}
-
-void nextAudio(){
-  setAudioPlaybackPosition(audioIndex);
-  audioIndex = (audioIndex+1)%3;
-  audioFileName = getAudioFilename(audioIndex);
-  audioPosition = getAudioPlaybackPosition(audioIndex) / 1000;
+void playNextAudio(){
+  au[audioIndex].saveSeekPosition();
+  audioIndex = (audioIndex+1)%AUDIO_COUNT;
   audio.play("switch.wav",0,1);
-  audio.play(audioFileName,audioPosition,0);
-  setAudioPlaybackStartedTimestamp(audioIndex);
-
-  Serial.print("Playing audio file ");
-  Serial.print(audioFileName);
-  Serial.println();
+  audio.play(au[audioIndex].fileName, au[audioIndex].seekPosition, 0);
+  au[audioIndex].playbackStartedTimestamp = millis();
 }
 
-//MOTOR MOVEMENT PATTERN
-
-void nextPattern(){
-  patternIndex = (patternIndex+1)%2;
-  completedPatternCount = completedPatternCount+1;
-  Serial.print("Switching to pattern ");
-  Serial.print(patternIndex);
-  Serial.println();
-}
-
-void nextPatternStep(){
-  patternStep = (patternStep + 1) % 9;
-}
-
-bool isPatternComplete(){
-  return patternStep == 8;
+uint8_t nextMotor(){
+  if (patternStep == MOTOR_COUNT-1) patternIndex = (patternIndex+1) % PATTERN_COUNT;
+  patternStep = (patternStep + 1) % MOTOR_COUNT;
+  uint8_t id = patterns[patternIndex][patternStep];
+  m[id].print("Next Motor");
+  playNextAudio();
+  return id;
 }
 
 void loop() {
 
-  if (completedPatternCount = -1){
+  for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
 
-    if (!allMotorsRetracted) {
-      retractAllMotors();
-      turnOnAllLEDs();
-    }
-    else {
-      Serial.print("Starting movement sequence");
-      Serial.println();
-      turnOffAllLEDs();
-      setMotorIsAllowedToMove(patterns[patternIndex][patternStep], true);
-      completedPatternCount = 0;
-    }
+    if (!m[i].isInitialized) m[i].setLEDBrightness(255);
+    if (isSameBoardMotorMoving(i) && !m[i].isWaiting) m[i].wait( getSameBoardMotorId(i) );
+    if (!isSameBoardMotorMoving(i) && m[i].isWaiting) m[i].noWait( getSameBoardMotorId(i) );
+    if (!m[i].reachedTarget() && !m[i].isWaiting) m[i].move();
+    if (m[i].reachedTarget() && !m[i].isStopped) {
+      
+      m[i].stop();
 
-  } else {
-
-    for (int motorIndex = 0; motorIndex < 9; motorIndex++) {
-      if (isAllowedToMove(motorIndex)) {
-        if (isFullyRetracted(motorIndex) && !isExtending(motorIndex)) {
-          nextAudio();
-          turnOnLED(motorIndex);
-          extend(motorIndex);
-        }
-        else if (isExtending(motorIndex) && isMovementComplete(motorIndex) && !isFullyExtended(motorIndex)) {
-          setIsFullyExtended(motorIndex);
-          stop(motorIndex);
-        } else if (isFullyExtended(motorIndex) && !isRetracting(motorIndex)) {
-          retract(motorIndex);
-          turnOffLED(motorIndex);
-          if (isPatternComplete()) nextPattern();
-          nextPatternStep();
-          setMotorIsAllowedToMove(patterns[patternIndex][patternStep], true);
-        } else if (isRetracting(motorIndex) && isMovementComplete(motorIndex) && !isFullyRetracted(motorIndex)) {
-          setIsFullyRetracted(motorIndex);
-          stop(motorIndex);
-          setMotorIsAllowedToMove(motorIndex, false);
-        }
+      if (!runPatterns && !allMotorsInitialized()) m[i].setInitialized();
+      if (!runPatterns && allMotorsInitialized()) {
+        Serial.println("All initialized");
+        runPatterns = true;
+        m[ nextMotor() ].setTargetPosition(MAX_POSITION);
+      }
+      
+      if (runPatterns) {
+        m[i].setTargetPosition(0);
+        if (m[i].position == MAX_POSITION) m[ nextMotor() ].setTargetPosition(MAX_POSITION);
       }
     }
   }
