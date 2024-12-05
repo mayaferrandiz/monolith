@@ -29,7 +29,14 @@ class EntityCycler {
       EntityCycler(T* objArray, size_t objCount) : objects(objArray), count(objCount) {}
 
     T& getCurrent() const { return objects[index]; }
-    T& next() { index = (index + 1) % count; }
+    T& next(const char * entityName) { 
+      Serial.print(entityName);
+      Serial.print("Index ");
+      Serial.print(index);
+      index = (index + 1) % count; 
+      Serial.print(" -> ");
+      Serial.println(index);
+    }
     bool reachedEnd() { return index == count-1; }
     size_t getIndex() { return index; }
 };
@@ -165,37 +172,38 @@ struct Audio {
 };
 
 Adafruit_NeoPixel led_0(LED_COUNT, 47, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel led_1(LED_COUNT, 37, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel led_2(LED_COUNT, 41, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led_1(LED_COUNT, 41, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led_2(LED_COUNT, 30, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel led_3(LED_COUNT, 49, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel led_4(LED_COUNT, 31, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel led_5(LED_COUNT, 35, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel led_6(LED_COUNT, 29, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel led_7(LED_COUNT, 39, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel led_8(LED_COUNT, 33, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led_4(LED_COUNT, 35, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led_5(LED_COUNT, 39, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led_6(LED_COUNT, 32, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led_7(LED_COUNT, 33, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led_8(LED_COUNT, 37, NEO_GRB + NEO_KHZ800);
 
 Motor motor2(45, 43, 0, 0, 2, &led_2);
 Motor motor3(48, 46, 0, 1, 3, &led_3);
 Motor motor5(44, 42, 1, 0, 5, &led_5);
 Motor motor8(40, 38, 1, 1, 8, &led_8);
-Motor motor1(10, 4 , 2, 0, 1, &led_1);
-Motor motor4(3 , 2 , 2, 1, 4, &led_4);
+Motor motor1(4 , 3 , 2, 0, 1, &led_1);
+Motor motor4(14, 15, 2, 1, 4, &led_4);
 Motor motor6(7 , 6 , 3, 1, 6, &led_6);
 Motor motor7(9 , 8 , 3, 0, 7, &led_7);
 Motor motor0(36, 34, 4, 0, 0, &led_0);
 
 Motor m[MOTOR_COUNT] = {motor0,motor1,motor2,motor3,motor4,motor5,motor6,motor7,motor8};
 
-static const uint8_t PATTERN_COUNT = 5;
+static const uint8_t PATTERN_COUNT = 2;
 uint8_t radial[MOTOR_COUNT] = { 0, 1, 2, 4, 3, 5, 6, 8, 7};
 uint8_t opposites[MOTOR_COUNT] = { 0, 5, 2, 8, 1, 7, 4, 6, 3};
+
 Pattern retractAll(radial, MIN_POSITION, MIN_POSITION);
 Pattern extendAll(radial, MAX_POSITION, MAX_POSITION);
 Pattern radialMax(radial);
 Pattern radialShortRetract(radial, MAX_POSITION, 3*MAX_POSITION/4);
 Pattern oppositesMax(opposites);
 Pattern oppositesShortExtend(opposites, 3*MAX_POSITION/4, MIN_POSITION);
-Pattern p[PATTERN_COUNT] = {retractAll, radialMax, radialShortRetract, oppositesMax, extendAll};
+Pattern p[PATTERN_COUNT] = {retractAll, radialMax};//, radialShortRetract, oppositesMax, extendAll};
 EntityCycler<Pattern> patterns(p, PATTERN_COUNT);
 
 static const uint8_t AUDIO_COUNT = 2;
@@ -247,18 +255,22 @@ bool isSameBoardMotorMoving(uint8_t i){
 
 void nextTrack(){
   tracks.getCurrent().saveSeekPosition();
-  Audio track = tracks.next();
-  audio.play("switch.wav",0,1);
-  audio.play(track.fileName, track.seekPosition, 0);
-  track.playbackStartedTimestamp = millis();
+  //Audio track = tracks.next();
+  //audio.play("switch.wav",0,1);
+  //audio.play(track.fileName, track.seekPosition, 0);
+  //track.playbackStartedTimestamp = millis();
 }
 
 void nextPattern(){
   if ( patterns.getCurrent().reachedEnd() ){ //reached last entry in pattern
-    if (patterns.reachedEnd()) patterns.next(); //advance twice to skip init pattern
-    patterns.next();
+    Serial.println("END OF PATTERN, NEXT PATTERN");
+    if (patterns.reachedEnd()) {
+      Serial.println("SKIPPING!!!");
+      patterns.next("Pattern"); //advance twice to skip init pattern
+    }
+    patterns.next("Pattern");
   }
-  patterns.getCurrent().next(); //next entry in array from pattern
+  patterns.getCurrent().next("Motor"); //next entry{} in array from pattern
   Serial.print("Pattern ");
   Serial.print(patterns.getIndex());
   Serial.print(" on step ");
@@ -279,7 +291,7 @@ void loop() {
         m[i].setTargetPosition( patterns.getCurrent().origin, false);
         nextPattern();
         m[ patterns.getCurrent().getCurrent() ].setTargetPosition( patterns.getCurrent().destination, true );
-        nextTrack();
+        //nextTrack();
       }
     }
   }
