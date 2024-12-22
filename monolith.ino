@@ -8,6 +8,12 @@
 #define MAX_POSITION 4500
 #define MIN_POSITION 0
 
+#define AUDIO_PLAYBACK_DURATION 9000
+#define AUDIO_MAX_VOLUME 4
+#define AUDIO_MIN_VOLUME 0
+#define SWITCH_TRACK_DURATION 1837
+#define FADE_AUDIO_STEP 500
+
 TMRpcm audio;
 
 struct Pattern;
@@ -141,18 +147,70 @@ struct Pattern : public EntityCycler<uint8_t> {
 struct AudioTrack {
   char const * fileName;
   unsigned long duration;
-  unsigned long seekPosition;
-  unsigned long playbackStartedTimestamp;
+  unsigned long seekPosition = 0;
+  unsigned long playbackStartedTimestamp = 0;
+  unsigned long playbackEndedTimestamp = 1;
+  unsigned long fadeUpdateTimestamp = 0;
+  bool canPlay = false;
+  bool isPlaying = false;
+  bool fade = 0; //-1 = fade out, 1 = fade in
+  unsigned int volume = AUDIO_MIN_VOLUME;
 
+  bool isFadingOut(){ return fade==-1;}
+  bool shouldStart(){ return !isPlaying && canPlay && playbackStartedTimestamp < playbackEndedTimestamp; }
+  bool shouldEnd(){ return isPlaying && playbackStartedTimestamp + AUDIO_PLAYBACK_DURATION - AUDIO_MAX_VOLUME*FADE_AUDIO_STEP < millis(); }
+  bool shouldPause() {return isPlaying && volume==AUDIO_MIN_VOLUME; }
+  bool shouldStepFade(){ 
+    if (fade==-1) return volume!=AUDIO_MIN_VOLUME && fadeUpdateTimestamp+FADE_AUDIO_STEP<millis(); 
+    else if (fade==1) return volume!=AUDIO_MAX_VOLUME && fadeUpdateTimestamp+FADE_AUDIO_STEP<millis();
+    else if (fade==0) return false;
+  }
+  void allowPlay(){ canPlay = true; }
+  void startFadeOut(){ fade=-1; }
+  void startFadeIn(){ fade=1; }
   void saveSeekPosition(){
-    unsigned long now = millis();
-    unsigned long incrementalPlayback = now - playbackStartedTimestamp;
+    unsigned long incrementalPlayback = millis() - playbackStartedTimestamp;
 
     if (seekPosition + incrementalPlayback > duration) seekPosition = (seekPosition + incrementalPlayback)%duration;
     else seekPosition = seekPosition + incrementalPlayback;
   }
 
-  AudioTrack(char const * fn, unsigned long dur, unsigned long seek, unsigned long ts) : fileName(fn), duration(dur), seekPosition(seek), playbackStartedTimestamp(ts) {}
+  void stepFade(){
+    fadeUpdateTimestamp = millis();
+    Serial.print("Fading audio from ");
+    Serial.print(volume);
+    Serial.print(" to ");
+    volume = volume+fade;
+    Serial.print(volume);
+    if (volume == AUDIO_MIN_VOLUME && fade == -1) fade = 0;
+    else if (volume == AUDIO_MAX_VOLUME && fade == 1) fade = 0;
+  }
+
+  void play(){
+    playbackStartedTimestamp = millis();
+    isPlaying = true;
+    float seek = round(seekPosition/1000);
+    Serial.print("Playing track ");
+    Serial.print(fileName);
+    Serial.print(" starting at seek position ");
+    Serial.println(seekPosition);
+    //audio.play("switch.wav",0,1);
+    audio.play(fileName, seek, 0);
+  }
+
+  void pause(){
+    playbackEndedTimestamp = millis();
+    isPlaying = false;
+    canPlay = false;
+    this->saveSeekPosition();
+    audio.stopPlayback();
+    Serial.print("Pausing track ");
+    Serial.print(fileName);
+    Serial.print(" at seek position ");
+    Serial.println(seekPosition);
+  }
+
+  AudioTrack(char const * fn, unsigned long dur) : fileName(fn), duration(dur) {}
 };
 
 Adafruit_NeoPixel led_0(LED_COUNT, 47, NEO_GRB + NEO_KHZ800);
@@ -195,8 +253,8 @@ Pattern p[PATTERN_COUNT] = {radialRetractAll, oppositesMax, radialMax};//, radia
 EntityCycler<Pattern> patterns(p, PATTERN_COUNT);
 
 static const uint8_t AUDIO_COUNT = 2;
-AudioTrack audio1("file1.wav", 1000, 0, 0);
-AudioTrack audio2("file2.wav", 1000, 0, 0);
+AudioTrack audio1("onset.wav", 54059);
+AudioTrack audio2("upset.wav", 77089);
 AudioTrack au[AUDIO_COUNT] = {audio1,audio2};
 EntityCycler<AudioTrack> tracks(au, AUDIO_COUNT);
 
@@ -207,10 +265,9 @@ void setup() {
   audio.speakerPin = 5;
   pinMode(11, OUTPUT);
   audio.loop(1);
+  audio.setVolume(AUDIO_MAX_VOLUME);
 
-  for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
-    m[i].init();
-  }
+  for (uint8_t i = 0; i < MOTOR_COUNT; i++) m[i].init();
 }
 
 bool isSameBoardMotorMoving(uint8_t i){
@@ -223,17 +280,6 @@ uint8_t countMotorsMoving(){
   uint8_t count = 0;
   for (uint8_t i = 0; i < MOTOR_COUNT; i++) if (m[i].isMoving) count = count+1;
   return count;
-}
-
-void nextTrack(){
-  tracks.getCurrent().saveSeekPosition();
-  tracks.next();
-  AudioTrack track = tracks.getCurrent();
-  audio.play("switch.wav",0,1);
-  audio.play(track.fileName, track.seekPosition, 0);
-  track.playbackStartedTimestamp = millis();
-  Serial.print("Playing track ");
-  Serial.println(track.fileName);
 }
 
 Pattern& getNextPattern(){
@@ -252,32 +298,44 @@ Pattern& getNextPattern(){
 
 void loop() {
 
+  Pattern& p = patterns.getCurrent();
+  AudioTrack& track = tracks.getCurrent();
+
   for (uint8_t i = 0; i < MOTOR_COUNT; i++) {
+
+    if (track.shouldStepFade()) track.stepFade();
+
+    if (track.shouldStart()) {
+      track.startFadeIn();
+      track.stepFade();
+      track.play();
+    } 
+    else if (track.shouldEnd()){
+      track.startFadeOut();
+      track.stepFade();
+      m[i].setTargetPosition(p.origin);
+      m[i].completedPattern = true;
+      p = getNextPattern();
+      uint8_t j = p.getMotorID();
+      m[j].setTargetPosition(p.destination);
+      m[j].completedPattern = false;
+    }
+    else if (track.shouldPause()) {
+      track.pause();
+      tracks.next();
+      track = tracks.getCurrent();
+    }
 
     uint8_t countMoving = countMotorsMoving();
     bool sameBoardMotorMoving = isSameBoardMotorMoving(i);
-
+    
     if ((sameBoardMotorMoving || countMoving > MAX_MOTORS_MOVING) && !m[i].isStopped) m[i].stop();
     else if (!sameBoardMotorMoving && countMoving < MAX_MOTORS_MOVING && !m[i].canMove) m[i].allowMove();
 
     if (!m[i].reachedTarget() && m[i].canMove) m[i].move();
     else if (m[i].reachedTarget() && !m[i].isStopped) {
-      
       m[i].stop();
-
-      if (!m[i].completedPattern){
-
-        Pattern p = patterns.getCurrent();
-        m[i].setTargetPosition(p.origin);
-        m[i].completedPattern = true;
-
-        p = getNextPattern();
-        uint8_t j = p.getMotorID();
-        m[j].setTargetPosition(p.destination);
-        m[j].completedPattern = false;
-
-        nextTrack();
-      }
+      if (!track.isPlaying && !m[i].completedPattern) track.allowPlay();    
     }
   }
 }
